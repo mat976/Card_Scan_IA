@@ -113,5 +113,30 @@
     "type": "SET",
     "value": "a2",
     "status": "correct"
+  },
+  {
+    "type": "SET",
+    "value": "a2",
+    "status": "correct"
+  },
+  {
+    "type": "SET",
+    "value": "a2",
+    "status": "correct"
+  },
+  {
+    "type": "ID_CARD",
+    "value": "168",
+    "status": "correct"
+  },
+  {
+    "type": "SET",
+    "value": "a1",
+    "status": "correct"
+  },
+  {
+    "type": "SET",
+    "value": "261",
+    "status": "correct"
   }
 ]
