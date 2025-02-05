@@ -1,3 +1,13 @@
+import tensorflow as tf
+tf.get_logger().setLevel('ERROR')  # Suppress TensorFlow warnings
+tf.autograph.set_verbosity(0)  # Suppress AutoGraph warnings
+
+# Explicitly disable AutoGraph conversion for problematic functions
+@tf.autograph.experimental.do_not_convert
+def infer_framework(*args, **kwargs):
+    # Placeholder function to prevent AutoGraph conversion warnings
+    pass
+
 import os
 import json
 import tkinter as tk
@@ -5,11 +15,22 @@ from tkinter import filedialog, messagebox, ttk, simpledialog
 from PIL import Image, ImageTk
 import easyocr
 import numpy as np
-import tensorflow as tf
 from transformers import (
     AutoTokenizer, 
     TFAutoModelForTokenClassification, 
     pipeline
+)
+import pandas as pd
+from sklearn.model_selection import train_test_split
+import logging
+import traceback
+
+# Configuration du logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    filename='ner_training.log',
+    filemode='w'
 )
 
 class CardNERApp:
@@ -108,6 +129,8 @@ class CardNERApp:
         self.current_image_path = None
         self.images_list = []
         self.current_entities = []
+        self.model_trained = False
+        self.logger = logging.getLogger(__name__)
 
         # Charger les images du dossier assets par défaut
         self.load_images_from_assets()
@@ -305,6 +328,294 @@ class CardNERApp:
             traceback.print_exc()
             messagebox.showerror("Erreur NER", f"Impossible d'analyser le texte : {str(e)}")
 
+    def prepare_training_data(self):
+        """Préparer les données d'entraînement pour le modèle NER"""
+        try:
+            # Charger les annotations JSON
+            with open('training_data/ner_annotations.json', 'r', encoding='utf-8') as f:
+                annotations = json.load(f)
+
+            # Définir un mapping cohérent des labels
+            label_map = {
+                'O': 0,
+                'B-NUM_CARD': 1,
+                'I-NUM_CARD': 2,
+                'B-SET': 3,
+                'I-SET': 4,
+                'B-ID_CARD': 5,
+                'I-ID_CARD': 6
+            }
+            reverse_label_map = {v: k for k, v in label_map.items()}
+
+            texts = []
+            labels_list = []
+
+            # Filtrer et traiter les annotations
+            valid_annotations = [
+                ann for ann in annotations 
+                if ann.get('status') == 'correct' and ann.get('value')
+            ]
+
+            print(f"Types d'entités détectés : {set(ann['type'] for ann in valid_annotations)}")
+            print(f"Nombre total d'annotations : {len(valid_annotations)}")
+
+            for annotation in valid_annotations:
+                text = annotation.get('value', '')
+                entity_type = annotation.get('type', '')
+
+                # Tokenizer avec padding et troncage
+                tokenized = self.tokenizer(
+                    text, 
+                    padding='max_length', 
+                    truncation=True, 
+                    max_length=128, 
+                    return_tensors='tf'
+                )
+
+                # Initialiser les labels avec 'O'
+                word_labels = [label_map['O']] * len(tokenized['input_ids'][0])
+
+                # Mapper les types d'entités aux labels
+                if entity_type == 'NUM_CARD':
+                    word_labels[1] = label_map['B-NUM_CARD']  # Première position après [CLS]
+                elif entity_type == 'SET':
+                    word_labels[1] = label_map['B-SET']
+                elif entity_type == 'ID_CARD':
+                    word_labels[1] = label_map['B-ID_CARD']
+
+                texts.append(tokenized)
+                labels_list.append(word_labels)
+
+            # Vérifications supplémentaires
+            print(f"Nombre de séquences de texte : {len(texts)}")
+            print(f"Nombre de séquences de labels : {len(labels_list)}")
+            
+            # Distribution des labels
+            flat_labels = np.concatenate(labels_list)
+            unique_labels, label_counts = np.unique(flat_labels, return_counts=True)
+            
+            print("\nDistribution des labels :")
+            for label, count in zip(unique_labels, label_counts):
+                print(f"{reverse_label_map.get(label, 'Unknown')}: {count}")
+
+            return texts, labels_list
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            messagebox.showerror("Erreur de préparation", str(e))
+            return None
+
+    def train_ner_model(self):
+        """Entraîner le modèle NER avec les annotations"""
+        try:
+            # Préparer les données
+            training_data = self.prepare_training_data()
+            
+            if training_data is None:
+                messagebox.showerror("Erreur", "Impossible de préparer les données d'entraînement.")
+                return
+
+            texts, labels = training_data
+
+            # Vérifier qu'il y a suffisamment de données
+            if len(texts) < 10:
+                messagebox.showerror("Erreur", "Pas assez de données pour l'entraînement. Ajoutez plus d'annotations.")
+                return
+
+            # Encoder les labels de manière consécutive et zéro-indexée
+            unique_labels = sorted(set(np.concatenate(labels)))
+            label_to_id = {label: idx for idx, label in enumerate(unique_labels)}
+            
+            # Convertir les labels en indices
+            encoded_labels = [[label_to_id[label] for label in seq] for seq in labels]
+
+            # Diviser les données
+            X_train, X_test, y_train, y_test = train_test_split(
+                texts, encoded_labels, test_size=0.2, random_state=42
+            )
+
+            # Convertir les données en format approprié avec gestion des erreurs
+            def prepare_dataset(inputs, labels):
+                try:
+                    return {
+                        'input_ids': tf.stack([x['input_ids'][0] for x in inputs]),
+                        'attention_mask': tf.stack([x['attention_mask'][0] for x in inputs])
+                    }, tf.ragged.constant(labels).to_tensor(shape=[None, None])
+                except Exception as e:
+                    print(f"Erreur de préparation du dataset : {e}")
+                    return None
+
+            train_dataset = prepare_dataset(X_train, y_train)
+            test_dataset = prepare_dataset(X_test, y_test)
+
+            if train_dataset is None or test_dataset is None:
+                messagebox.showerror("Erreur", "Impossible de préparer les données d'entraînement.")
+                return
+
+            # Nombre de labels
+            num_labels = len(unique_labels)
+
+            print(f"Nombre total de labels : {num_labels}")
+            print(f"Mapping des labels : {label_to_id}")
+
+            # Configuration de l'entraînement avec des paramètres plus stables
+            learning_rate = 3e-5  # Légèrement réduit
+            batch_size = 4  # Réduit pour plus de stabilité
+            epochs = 5  # Réduit pour éviter le surapprentissage
+
+            # Réinitialiser le modèle avec des configurations de régularisation
+            model = TFAutoModelForTokenClassification.from_pretrained(
+                'google/mobilebert-uncased', 
+                num_labels=num_labels,
+                from_pt=True,  # Charger les poids PyTorch si nécessaire
+                ignore_mismatched_sizes=True  # Ignorer les différences de taille de couche
+            )
+
+            # Compiler le modèle avec des paramètres de régularisation
+            optimizer = tf.keras.optimizers.Adam(
+                learning_rate=learning_rate, 
+                epsilon=1e-8,  # Petit epsilon pour stabilité numérique
+                clipnorm=1.0  # Écrêtage du gradient
+            )
+            loss = tf.keras.losses.SparseCategoricalCrossentropy(
+                from_logits=True, 
+                reduction=tf.keras.losses.Reduction.AUTO
+            )
+
+            model.compile(
+                optimizer=optimizer, 
+                loss=loss, 
+                metrics=['accuracy']
+            )
+
+            # Callbacks améliorés
+            early_stopping = tf.keras.callbacks.EarlyStopping(
+                monitor='val_loss', 
+                patience=3, 
+                restore_best_weights=True,
+                min_delta=0.001  # Amélioration minimale requise
+            )
+
+            # Entraînement avec gestion des erreurs
+            print("\nDébut de l'entraînement...")
+            print(f"Taille du lot : {batch_size}")
+            print(f"Taux d'apprentissage : {learning_rate}")
+            print(f"Nombre d'époques : {epochs}")
+
+            try:
+                history = model.fit(
+                    train_dataset[0],
+                    train_dataset[1],
+                    validation_data=test_dataset,
+                    epochs=epochs,
+                    batch_size=batch_size,
+                    callbacks=[early_stopping]
+                )
+
+                # Sauvegarder le modèle
+                model_save_path = os.path.join('models', 'ner_model')
+                os.makedirs('models', exist_ok=True)
+                model.save_pretrained(model_save_path)
+                self.tokenizer.save_pretrained(model_save_path)
+
+                messagebox.showinfo("Entraînement", "Modèle entraîné avec succès!")
+                self.model_trained = True
+
+                return history
+
+            except Exception as e:
+                messagebox.showerror("Erreur d'entraînement", str(e))
+                import traceback
+                traceback.print_exc()
+                return None
+
+        except Exception as e:
+            messagebox.showerror("Erreur", str(e))
+            import traceback
+            traceback.print_exc()
+            return None
+
+    def train_model(self):
+        """Wrapper pour préparer et entraîner le modèle"""
+        # Charger les annotations existantes
+        try:
+            with open('training_data/ner_annotations.json', 'r') as f:
+                existing_data = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            existing_data = []
+
+        # Filtrer les entités correctes et éditées
+        training_entities = [
+            entity for entity in self.current_entities 
+            if entity['status'] in ['correct', 'edited']
+        ]
+
+        if not training_entities:
+            messagebox.showwarning("Attention", "Aucune donnée d'entraînement disponible.")
+            return
+
+        # Filtres de validation
+        def is_valid_entity(entity):
+            # Filtres personnalisés
+            value = entity['value'].strip().lower()
+            
+            # Filtres pour NUM_CARD
+            if entity['type'] == 'NUM_CARD':
+                # Doit contenir des chiffres et potentiellement des tirets
+                return len(value) >= 10 and any(c.isdigit() for c in value)
+            
+            # Filtres pour ID_CARD
+            if entity['type'] == 'ID_CARD':
+                # Doit être un identifiant court et significatif
+                return len(value) >= 3 and len(value) <= 10 and any(c.isdigit() for c in value)
+            
+            # Filtres pour SET
+            if entity['type'] == 'SET':
+                # Doit être un texte court et significatif
+                return len(value) >= 1 and len(value) <= 10
+            
+            return False
+
+        # Filtrer et nettoyer les entités
+        filtered_entities = [
+            entity for entity in training_entities 
+            if is_valid_entity(entity)
+        ]
+
+        # Vérifier la redondance
+        unique_entities = []
+        seen_values = set()
+        for entity in filtered_entities:
+            # Éviter les doublons stricts
+            if entity['value'] not in seen_values:
+                unique_entities.append(entity)
+                seen_values.add(entity['value'])
+
+        # Combiner avec les données existantes
+        if unique_entities:
+            # Ajouter les nouvelles entités uniques
+            existing_data.extend(unique_entities)
+
+            # Limiter à un nombre maximal d'annotations
+            max_annotations = 100
+            if len(existing_data) > max_annotations:
+                existing_data = existing_data[-max_annotations:]
+
+            # Sauvegarder
+            with open('training_data/ner_annotations.json', 'w') as f:
+                json.dump(existing_data, f, indent=2)
+
+            # Lancer l'entraînement
+            self.train_ner_model()
+
+        else:
+            messagebox.showwarning(
+                "Attention", 
+                "Aucune nouvelle entité valide n'a été trouvée.\n"
+                "Vérifiez vos annotations."
+            )
+
     def mark_correct(self):
         """Marquer l'entité sélectionnée comme correcte"""
         selected_item = self.ner_tree.selection()
@@ -364,27 +675,13 @@ class CardNERApp:
             
             self.ner_tree.item(selected_item, values=(new_type, new_value, 'Édité '))
 
-    def train_model(self):
-        """Entraîner le modèle avec les données annotées"""
-        # Filtrer les entités correctes et éditées
-        training_entities = [
-            entity for entity in self.current_entities 
-            if entity['status'] in ['correct', 'edited']
-        ]
-
-        if not training_entities:
-            messagebox.showwarning("Attention", "Aucune donnée d'entraînement disponible.")
-            return
-
-        # Ajouter au dataset d'entraînement
-        self.training_data.extend(training_entities)
-
-        # Sauvegarder les données d'entraînement
-        os.makedirs('training_data', exist_ok=True)
-        with open('training_data/ner_annotations.json', 'w') as f:
-            json.dump(self.training_data, f, indent=2)
-
-        messagebox.showinfo("Entraînement", f"{len(training_entities)} entités ajoutées au dataset d'entraînement.")
+    def view_annotations(self):
+        # Afficher les annotations pour vérification
+        annotation_text = "\n".join(
+            f"{entity['type']} - {entity['value']}" 
+            for entity in self.training_data
+        )
+        messagebox.showinfo("Annotations", annotation_text)
 
 def main():
     root = tk.Tk()

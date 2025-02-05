@@ -1,0 +1,1 @@
+2025-02-05 13:30:14,769 - WARNING - Neither CUDA nor MPS are available - defaulting to CPU. Note: This module is much faster with a GPU.
